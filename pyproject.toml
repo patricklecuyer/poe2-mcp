@@ -8,7 +8,7 @@ version = "1.0.0"
 description = "AI-powered Path of Exile 2 build optimization MCP server"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [
     {name = "HivemindOverlord", email = "connor@portertech.llc"}
 ]
@@ -38,7 +38,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "mcp>=0.9.0",
+    "mcp>=0.9.0,<2.0.0",
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
     "pydantic>=2.5.0",
