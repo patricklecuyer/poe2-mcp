@@ -396,65 +396,73 @@ class CharacterFetcher:
         ``runesofaldurhc``, ``standard``, ...) — NOT the display name. The
         endpoint is fully public; no auth required.
         """
-        try:
-            league_slug = self._to_poe_ninja_league_slug(league)
-
-            # The events API returns Server-Sent Events (SSE) with model ID
-            # Format: data: {"version":4211492750}
+        async def _fetch_model_by_slug(slug: str) -> Optional[Dict[str, Any]]:
             events_url = (
                 f"{settings.POE_NINJA_PROFILE_URL}/poe2/api/events/character/"
-                f"{account_name}/{league_slug}/{character_name}"
+                f"{account_name}/{slug}/{character_name}"
             )
-
             logger.info(f"Fetching character model ID from: {events_url}")
             await self.rate_limiter.acquire()
+            try:
+                async with self.client.stream("GET", events_url) as response:
+                    if response.status_code != 200:
+                        logger.warning(f"Events API returned status: {response.status_code} for {events_url}")
+                        return None
 
-            # Stream the SSE response and extract the model ID
-            async with self.client.stream("GET", events_url) as response:
-                if response.status_code != 200:
-                    logger.warning(f"Events API returned status: {response.status_code}")
-                    return None
+                    # Read the first SSE message
+                    model_id = None
+                    async for line in response.aiter_lines():
+                        if line.startswith("data:"):
+                            import json
 
-                # Read the first SSE message
-                model_id = None
-                async for line in response.aiter_lines():
-                    if line.startswith("data:"):
-                        import json
+                            # Parse the SSE data line
+                            data_str = line[5:].strip()  # Remove "data:" prefix
+                            try:
+                                data = json.loads(data_str)
+                                model_id = data.get("version")
+                                logger.info(f"Got model ID: {model_id}")
+                                break  # We only need the first message
+                            except Exception:
+                                continue
 
-                        # Parse the SSE data line
-                        data_str = line[5:].strip()  # Remove "data:" prefix
-                        try:
-                            data = json.loads(data_str)
-                            model_id = data.get("version")
-                            logger.info(f"Got model ID: {model_id}")
-                            break  # We only need the first message
-                        except:
-                            continue
+                    if not model_id:
+                        return None
 
-                if not model_id:
-                    self.last_error_message = f"Could not extract model ID from poe.ninja events stream for {character_name}"
-                    logger.warning(self.last_error_message)
-                    return None
+                # Now fetch the character model using the ID
+                model_url = (
+                    f"{settings.POE_NINJA_PROFILE_URL}/poe2/api/profile/characters/"
+                    f"{account_name}/{slug}/{character_name}/model/{model_id}"
+                )
+                logger.info(f"Fetching character model from: {model_url}")
+                await self.rate_limiter.acquire()
 
-            # Now fetch the character model using the ID
-            model_url = (
-                f"{settings.POE_NINJA_PROFILE_URL}/poe2/api/profile/characters/"
-                f"{account_name}/{league_slug}/{character_name}/model/{model_id}"
-            )
+                model_response = await self.client.get(model_url)
+                if model_response.status_code == 200:
+                    return model_response.json()
+            except Exception as e:
+                logger.warning(f"Error fetching model for slug {slug}: {e}")
+            return None
 
-            logger.info(f"Fetching character model from: {model_url}")
-            await self.rate_limiter.acquire()
+        try:
+            league_slug = self._to_poe_ninja_league_slug(league)
+            model_data = await _fetch_model_by_slug(league_slug)
 
-            model_response = await self.client.get(model_url)
-            if model_response.status_code == 200:
-                model_data = model_response.json()
+            # Auto-resolve league if initial slug failed
+            if not model_data:
+                try:
+                    resolved_slug = await self.ninja_api.resolve_character_league(account_name, character_name)
+                    if resolved_slug and resolved_slug != league_slug:
+                        logger.info(f"Retrying poe.ninja events fetch with auto-resolved league slug: {resolved_slug}")
+                        model_data = await _fetch_model_by_slug(resolved_slug)
+                except Exception as ex:
+                    logger.debug(f"League auto-resolution attempt failed: {ex}")
+
+            if model_data:
                 logger.info("Successfully fetched character model data")
                 return self._normalize_character_data(model_data, account_name, character_name)
             else:
-                self.last_error_message = (
-                    f"Model API returned HTTP {model_response.status_code} for {character_name}"
-                )
-                logger.error(self.last_error_message)
+                self.last_error_message = f"Could not fetch character model for {character_name}"
+                logger.warning(self.last_error_message)
                 return None
 
         except Exception as e:
@@ -691,6 +699,9 @@ class CharacterFetcher:
             "league": char_model.get("league", "Standard"),
             "experience": char_model.get("experience", 0),
             "items": char_model.get("items", char_model.get("equipment", [])),
+            "raw_items": char_model.get("items", []),
+            "raw_flasks": char_model.get("flasks", []),
+            "raw_jewels": char_model.get("jewels", []),
             "skills": char_model.get("skills", []),
             "passive_tree": passive_data,
             "keystones": char_model.get("keystones", []),
@@ -702,6 +713,16 @@ class CharacterFetcher:
             "raw_data": raw_data,  # Keep original data for reference
         }
 
+        # Normalize rich items if available from char_model
+        if char_model.get("items"):
+            try:
+                from ..utils.item_normalizer import extract_character_items
+                rich_items = extract_character_items(normalised, include_flasks=False, include_jewels=False)
+                if rich_items:
+                    normalised["items"] = rich_items
+            except Exception as e:
+                logger.debug(f"Could not extract rich items: {e}")
+
         # ------------------------------------------------------------------
         # Merge PoB-derived fields when available. PoB is authoritative for
         # items/skills/passive_tree (its export embeds them in
@@ -711,7 +732,8 @@ class CharacterFetcher:
         # ------------------------------------------------------------------
         if pob_data:
             # PoB items/skills/tree are richer and structurally-complete; prefer them.
-            if pob_data.get("items"):
+            # If we don't have rich items from char_model, use pob_data["items"]
+            if pob_data.get("items") and not char_model.get("items"):
                 normalised["items"] = pob_data["items"]
             if pob_data.get("skills"):
                 normalised["skills"] = pob_data["skills"]

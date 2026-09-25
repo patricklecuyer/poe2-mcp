@@ -60,6 +60,12 @@ try:
     # Local live-game readers (Client.txt log + client config INI)
     from .api.client_log_reader import ClientLogReader
     from .api.game_config_reader import GameConfigReader
+    from .utils.item_normalizer import (
+        normalize_raw_item,
+        extract_character_items,
+        extract_raw_character_payload,
+        format_items_markdown,
+    )
 except ImportError:
     # Fallback for direct execution
     from src.config import settings, DATA_DIR
@@ -101,6 +107,12 @@ except ImportError:
     # Local live-game readers (Client.txt log + client config INI)
     from src.api.client_log_reader import ClientLogReader
     from src.api.game_config_reader import GameConfigReader
+    from src.utils.item_normalizer import (
+        normalize_raw_item,
+        extract_character_items,
+        extract_raw_character_payload,
+        format_items_markdown,
+    )
 
 # Setup logging to both file and stderr (for Claude Desktop logs)
 import sys
@@ -449,8 +461,12 @@ class PoE2BuildOptimizerMCP:
         debug_log(f"Arguments: {arguments}")
 
         try:
-            # DATA ACCESS TOOLS (14 tools)
-            if name == "analyze_character":
+            # DATA ACCESS TOOLS (16 tools)
+            if name == "get_character_raw_data":
+                return await self._handle_get_character_raw_data(arguments)
+            elif name == "get_character_items":
+                return await self._handle_get_character_items(arguments)
+            elif name == "analyze_character":
                 return await self._handle_analyze_character(arguments)
             elif name == "search_items":
                 return await self._handle_search_items(arguments)
@@ -574,6 +590,104 @@ class PoE2BuildOptimizerMCP:
                 # ============================================
                 # DATA ACCESS TOOLS (14 tools)
                 # ============================================
+                # Raw Character & Items Data Access
+                types.Tool(
+                    name="get_character_raw_data",
+                    description=(
+                        "Fetch complete, un-truncated raw character data from poe.ninja / GGG API. "
+                        "Returns all gear items with complete mod affixes, rolls, values, properties, "
+                        "requirements, sockets/runes, plus allocated passive tree node IDs, skill gems, "
+                        "and computed defensive stats. Ideal for downstream agents and automated build optimizers."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "account": {
+                                "type": "string",
+                                "description": "Path of Exile account name (e.g., 'Tomawar40-2671')",
+                            },
+                            "character": {
+                                "type": "string",
+                                "description": "Character name to fetch",
+                            },
+                            "league": {
+                                "type": "string",
+                                "description": "League name or slug (e.g. 'Standard', 'runesofaldur'). Auto-resolved if omitted.",
+                                "default": "Standard",
+                            },
+                            "url": {
+                                "type": "string",
+                                "description": "Optional poe.ninja profile or build URL",
+                            },
+                            "section": {
+                                "type": "string",
+                                "description": "Section to return: 'all', 'items'/'equipment', 'flasks', 'jewels', 'passives', 'skills', 'stats'",
+                                "default": "all",
+                            },
+                            "format": {
+                                "type": "string",
+                                "description": "Output format: 'json' (default, structured with mod IDs & roll stats) or 'markdown'",
+                                "enum": ["json", "markdown"],
+                                "default": "json",
+                            },
+                            "include_raw_model": {
+                                "type": "boolean",
+                                "description": "Whether to include the unparsed poe.ninja charModel JSON payload (large)",
+                                "default": False,
+                            },
+                        },
+                    },
+                ),
+                types.Tool(
+                    name="get_character_items",
+                    description=(
+                        "Fetch character equipped gear, flasks, and jewels with full item affixes, "
+                        "explicit/implicit roll stats, mod IDs, quality, properties, sockets, and socketed runes/gems. "
+                        "Supports filtering by item slot."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "account": {
+                                "type": "string",
+                                "description": "Path of Exile account name",
+                            },
+                            "character": {
+                                "type": "string",
+                                "description": "Character name to fetch",
+                            },
+                            "league": {
+                                "type": "string",
+                                "description": "League name or slug (auto-resolved if omitted)",
+                                "default": "Standard",
+                            },
+                            "url": {
+                                "type": "string",
+                                "description": "Optional poe.ninja profile or build URL",
+                            },
+                            "slot": {
+                                "type": "string",
+                                "description": "Optional slot filter: 'Helm', 'BodyArmour', 'Gloves', 'Boots', 'Weapon', 'Offhand', 'Ring', 'Belt', 'Amulet', 'Flask', 'Jewel', etc.",
+                            },
+                            "include_flasks": {
+                                "type": "boolean",
+                                "description": "Include flasks in items list (default: True)",
+                                "default": True,
+                            },
+                            "include_jewels": {
+                                "type": "boolean",
+                                "description": "Include socketed jewels in items list (default: True)",
+                                "default": True,
+                            },
+                            "format": {
+                                "type": "string",
+                                "description": "Output format: 'json' (default) or 'markdown'",
+                                "enum": ["json", "markdown"],
+                                "default": "json",
+                            },
+                        },
+                    },
+                ),
                 # Character Data Access
                 types.Tool(
                     name="analyze_character",
@@ -1973,6 +2087,178 @@ Tracked at https://github.com/HivemindOverlord/poe2-mcp/issues/61.
         except Exception as e:
             logger.error(f"Character analysis failed: {e}")
             return [types.TextContent(type="text", text=f"Analysis failed: {str(e)}")]
+
+    async def _handle_get_character_raw_data(self, args: dict) -> List[types.TextContent]:
+        """
+        Fetch full un-truncated character raw data including items affixes and rolls.
+        Supports URL, section filtering, and JSON/markdown format.
+        """
+        url = args.get("url", "")
+        account = args.get("account")
+        character = args.get("character")
+        league = args.get("league", "Standard")
+
+        if url:
+            try:
+                from .api.poe_ninja_api import parse_poe_ninja_url
+            except ImportError:
+                from src.api.poe_ninja_api import parse_poe_ninja_url
+            parsed = parse_poe_ninja_url(url)
+            if parsed:
+                account = parsed.get("account") or account
+                character = parsed.get("character") or character
+                league = parsed.get("league") or league
+            else:
+                return [
+                    types.TextContent(
+                        type="text",
+                        text=f"Could not parse poe.ninja URL: {url}. Please provide a valid poe.ninja build/profile URL or account and character name.",
+                    )
+                ]
+
+        if not account or not character:
+            return [
+                types.TextContent(
+                    type="text",
+                    text="Missing required parameters: please provide either a poe.ninja 'url' or both 'account' and 'character'.",
+                )
+            ]
+
+        try:
+            character_data = await self.char_fetcher.get_character(
+                account_name=account, character_name=character, league=league
+            )
+            if not character_data:
+                return [
+                    types.TextContent(
+                        type="text",
+                        text=f"Character '{character}' not found for account '{account}' (league: {league}). {self.char_fetcher.last_error_message}",
+                    )
+                ]
+
+            section = args.get("section", "all")
+            include_raw_model = args.get("include_raw_model", False)
+            fmt = args.get("format", "json").lower()
+
+            payload = extract_raw_character_payload(
+                character_data,
+                section=section,
+                include_raw_model=include_raw_model,
+            )
+
+            if fmt == "markdown":
+                c = payload.get("character", {})
+                md_out = [
+                    f"# Raw Character Data: {c.get('name')} (Level {c.get('level')} {c.get('class')})",
+                    f"- **Account:** {c.get('account')}",
+                    f"- **League:** {c.get('league')}",
+                    f"- **Ascendancy:** {c.get('ascendancy') or 'None'}",
+                    "",
+                ]
+                if "equipment" in payload:
+                    md_out.append("## Equipment")
+                    md_out.append(format_items_markdown(payload["equipment"]))
+                if "flasks" in payload and payload.get("flasks"):
+                    md_out.append("## Flasks")
+                    md_out.append(format_items_markdown(payload["flasks"]))
+                if "jewels" in payload and payload.get("jewels"):
+                    md_out.append("## Jewels")
+                    md_out.append(format_items_markdown(payload["jewels"]))
+                if "passive_tree" in payload:
+                    tree = payload["passive_tree"]
+                    md_out.append("## Passive Tree")
+                    md_out.append(f"- **Total Nodes:** {tree.get('total_nodes')}")
+                    keystones_str = ', '.join(tree.get('keystones', [])) or 'None'
+                    md_out.append(f"- **Keystones:** {keystones_str}")
+                    alloc_ids = tree.get('allocated_node_ids', [])
+                    md_out.append(f"- **Allocated Nodes:** `{alloc_ids}`")
+                if "defensive_stats" in payload and payload.get("defensive_stats"):
+                    md_out.append("## Defensive Stats")
+                    for k, v in payload["defensive_stats"].items():
+                        md_out.append(f"- **{k}:** {v}")
+                return [types.TextContent(type="text", text="\n".join(md_out))]
+            else:
+                return [types.TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
+
+        except Exception as e:
+            logger.error(f"Error getting raw character data: {e}", exc_info=True)
+            return [types.TextContent(type="text", text=f"Error fetching character raw data: {str(e)}")]
+
+    async def _handle_get_character_items(self, args: dict) -> List[types.TextContent]:
+        """
+        Fetch items with full affixes, rolls, properties, requirements, sockets, and runes.
+        """
+        url = args.get("url", "")
+        account = args.get("account")
+        character = args.get("character")
+        league = args.get("league", "Standard")
+
+        if url:
+            try:
+                from .api.poe_ninja_api import parse_poe_ninja_url
+            except ImportError:
+                from src.api.poe_ninja_api import parse_poe_ninja_url
+            parsed = parse_poe_ninja_url(url)
+            if parsed:
+                account = parsed.get("account") or account
+                character = parsed.get("character") or character
+                league = parsed.get("league") or league
+            else:
+                return [
+                    types.TextContent(
+                        type="text",
+                        text=f"Could not parse poe.ninja URL: {url}.",
+                    )
+                ]
+
+        if not account or not character:
+            return [
+                types.TextContent(
+                    type="text",
+                    text="Missing required parameters: please provide either a poe.ninja 'url' or both 'account' and 'character'.",
+                )
+            ]
+
+        try:
+            character_data = await self.char_fetcher.get_character(
+                account_name=account, character_name=character, league=league
+            )
+            if not character_data:
+                return [
+                    types.TextContent(
+                        type="text",
+                        text=f"Character '{character}' not found for account '{account}'. {self.char_fetcher.last_error_message}",
+                    )
+                ]
+
+            slot_filter = args.get("slot")
+            include_flasks = args.get("include_flasks", True)
+            include_jewels = args.get("include_jewels", True)
+            fmt = args.get("format", "json").lower()
+
+            items = extract_character_items(
+                character_data,
+                slot_filter=slot_filter,
+                include_flasks=include_flasks,
+                include_jewels=include_jewels,
+            )
+
+            if fmt == "markdown":
+                md_text = f"# Items for {character} ({account})\n\n" + format_items_markdown(items)
+                return [types.TextContent(type="text", text=md_text)]
+            else:
+                payload = {
+                    "character": character,
+                    "account": account,
+                    "league": character_data.get("league", league),
+                    "total_items": len(items),
+                    "items": items,
+                }
+                return [types.TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
+
+        except Exception as e:
+            logger.error(f"Error getting character items: {e}", exc_info=True)
+            return [types.TextContent(type="text", text=f"Error fetching character items: {str(e)}")]
 
     async def _handle_nl_query(self, args: dict) -> List[types.TextContent]:
         """Handle natural language query"""
